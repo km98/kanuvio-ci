@@ -16,15 +16,42 @@
 #   * The private source is fetched with a fine-grained token that grants
 #     `Contents: Read-only` on that one repository. The token is passed to the
 #     checkout action's `token` input and nowhere else — it is never declared in
-#     a job- or workflow-level `env`, so `npm ci`, the tests and the build
-#     cannot read it. `persist-credentials: false` also keeps it out of the
-#     checked-out `.git/config`.
+#     any `env`, so `npm ci`, the tests and the build cannot read it.
+#     `persist-credentials: false` also keeps it out of the checked-out
+#     `.git/config`.
 #   * No artifacts, caches, packages, releases or deployments. The production
 #     build writes to the runner's scratch disk and nothing leaves it, which is
 #     why `setup-node` below turns its download cache off explicitly.
-#   * Logs contain only the tools' own diagnostics. Worth stating plainly: this
-#     repository is public, so its logs are public, and a failing typecheck or
-#     test prints the private source lines around the failure.
+#
+# Log handling — this repository is public, so its job logs are public, and the
+# bridge streams no command output into them:
+#   * Every step that runs project code goes through `run_quiet`, defined in the
+#     `Prepare private-log handling` step. It redirects stdout and stderr into a
+#     runner-local file and prints one line: the phase, the outcome, the exit
+#     status.
+#   * Raw output is never printed, on success or on failure. Nothing below reads
+#     a capture back: no `tail`, `head` or `grep` touches one, there is no `env`
+#     dump and no verbose or debug flag, and the only `cat` in the file writes the
+#     wrapper itself. The failing branch prints just a generic note that
+#     diagnostics have to be obtained through a separately approved safe process.
+#   * `run_quiet` deletes its capture file the moment the command exits, and the
+#     final `always()` step sweeps the capture directory and npm's own debug logs,
+#     so a failed or cancelled run leaves no captured output on the runner.
+#   * The two actions still log their own status lines by default, and those are
+#     kept: `checkout` reports the ref, commit and transport it used and registers
+#     the credential with the runner's masker before use, while `setup-node`
+#     reports the Node version and installs a TypeScript problem matcher. Both are
+#     facts about the run, not source content. Because compiler and test output is
+#     captured, that matcher surfaces nothing.
+#
+# Residual risk, stated plainly: suppressing logs cannot make source
+# confidential. The private checkout sits on the runner's disk for the life of
+# the job, and `npm ci`, the typecheck, the tests and the build execute
+# third-party install scripts and application code on a public GitHub-hosted
+# runner with network access. Malicious code in a dependency, or in the private
+# tree itself, can read that source and send it anywhere, and nothing in this
+# file prevents it. Treat this bridge as a way to keep source out of the public
+# log, not out of a hostile runner.
 #
 # This is Linux validation only. macOS signing and notarization, release
 # publishing, Windows packaging and every production credential stay in the
@@ -51,23 +78,82 @@ jobs:
       github.triggering_actor == 'km98'
     defaults:
       run:
-        # Every run step works inside the private checkout, never in this
-        # repository's workspace.
+        # Run steps work inside the private checkout, never in this repository's
+        # workspace. The two scaffolding steps override this back to `.`: one has
+        # to work before the checkout exists, the other after a failure.
         working-directory: private-source
     steps:
+      - name: Prepare private-log handling on the runner
+        working-directory: .
+        run: |
+          set -euo pipefail
+          log_dir="${RUNNER_TEMP:?}/kanuvio-private-ci"
+          mkdir -p "$log_dir"
+          rm -f -- "$log_dir/quiet-run.sh"
+          cat > "$log_dir/quiet-run.sh" <<'QUIET_RUN'
+          # quiet-run.sh — sourced by this bridge's steps, never executed directly.
+          #
+          # run_quiet <label> <command> [args...]
+          #
+          # Runs the command with both streams redirected into a runner-local
+          # file, prints one summary line, deletes that file, and returns the
+          # command's own exit status so a failure still fails the step.
+          #
+          # The file is not an artifact and never leaves the runner: nothing here
+          # uploads it, and the job's last step removes the directory it lives in.
+
+          KANUVIO_LOG_DIR="${RUNNER_TEMP:?}/kanuvio-private-ci"
+
+          run_quiet() {
+            local phase="${1:?a phase label is required}"
+            shift
+            local log_file="${KANUVIO_LOG_DIR}/${phase}.log"
+            local status=0
+
+            # The label becomes part of a path, so accept plain names only.
+            case "$phase" in
+              "" | *[!A-Za-z0-9_-]*)
+                printf 'bridge: rejected unsafe phase label\n'
+                return 2
+                ;;
+            esac
+
+            mkdir -p "$KANUVIO_LOG_DIR"
+
+            # The command's stdout and stderr reach the file and nowhere else.
+            "$@" >"$log_file" 2>&1 || status=$?
+
+            if [ "$status" -eq 0 ]; then
+              printf 'phase=%s status=success exit=%s\n' "$phase" "$status"
+            else
+              printf 'phase=%s status=failed exit=%s\n' "$phase" "$status"
+              printf 'phase=%s note=output was captured on the runner only and is not printed; obtain diagnostics through a separately approved safe process\n' "$phase"
+            fi
+
+            # Delete the capture now: on success it is noise, on failure it is
+            # the most sensitive file on the runner.
+            rm -f -- "$log_file"
+            return "$status"
+          }
+          QUIET_RUN
+          chmod 700 "$log_dir/quiet-run.sh"
+
       - name: Check out the private source with the read-only token
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: km98/embrace-your-books
           ref: main
           path: private-source
-          # Supplied as an action input only: this is the single place the
-          # token is used, and no step environment ever receives it.
+          # Supplied as an action input only: this is the single place the token
+          # is used, and no step environment ever receives it.
           token: ${{ secrets.KANUVIO_PRIVATE_READ_TOKEN }}
           persist-credentials: false
           # The whitespace check below compares the tip against its parent, and
           # the private Web CI uses the same full history for the same reason.
           fetch-depth: 0
+          # A hosted runner starts empty, so fetch progress would only add noise
+          # to a public log.
+          show-progress: false
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -75,34 +161,63 @@ jobs:
           # Node 24 is what the private Web CI uses and what the deployed build
           # was made with.
           node-version: 24
-          # setup-node caches npm downloads by default when package.json names
-          # an npm package manager. Caches are out of scope for this bridge.
+          # No `cache` input plus this set to false means the action saves no
+          # state for the package manager, so its post step has no key to write
+          # and no cache is created.
           package-manager-cache: false
 
-      # `npm ci` installs exactly what the committed lockfile pins, so a
-      # lockfile that has drifted from package.json fails the job instead of
-      # quietly changing what is validated.
+      # Each step below runs project code through `run_quiet`: the command's
+      # output is captured on the runner and only the phase summary is logged.
+
+      # `npm ci` installs exactly what the committed lockfile pins, so a lockfile
+      # that has drifted from package.json fails the step instead of quietly
+      # changing what is validated.
       - name: Install dependencies
-        run: npm ci
+        run: |
+          set -euo pipefail
+          source "${RUNNER_TEMP:?}/kanuvio-private-ci/quiet-run.sh"
+          run_quiet "install" npm ci
 
       - name: Typecheck
-        run: npm run typecheck
+        run: |
+          set -euo pipefail
+          source "${RUNNER_TEMP:?}/kanuvio-private-ci/quiet-run.sh"
+          run_quiet "typecheck" npm run typecheck
 
-      # The whole suite, run through the installed binary rather than `npx`, so
-      # a dependency missing from the lockfile fails the step. The only tests
-      # that touch a database are gated on a loopback Supabase stack and skip
+      # The whole suite, through the installed binary rather than `npx`, so a
+      # dependency missing from the lockfile fails the step. The only tests that
+      # touch a database are gated on a loopback Supabase stack and skip
       # themselves when its keys are absent, which they are here.
       - name: Test
-        run: ./node_modules/.bin/vitest run
+        run: |
+          set -euo pipefail
+          source "${RUNNER_TEMP:?}/kanuvio-private-ci/quiet-run.sh"
+          run_quiet "test" ./node_modules/.bin/vitest run
 
       - name: Build
-        run: npm run build
+        run: |
+          set -euo pipefail
+          source "${RUNNER_TEMP:?}/kanuvio-private-ci/quiet-run.sh"
+          run_quiet "build" npm run build
 
       # The private Web CI's own whitespace check. A dispatched run has no
       # `before` sha, so the change it is about is the tip commit on `main`.
       - name: Whitespace integrity
         run: |
           set -euo pipefail
+          source "${RUNNER_TEMP:?}/kanuvio-private-ci/quiet-run.sh"
           range="HEAD~1...HEAD"
-          echo "Checking whitespace in $range"
-          git diff --check "$range"
+          run_quiet "whitespace" git diff --check "$range"
+
+      # Runs even when a step above failed or the job was cancelled, so captured
+      # output never outlives the job that produced it.
+      - name: Remove captured output from the runner
+        if: always()
+        working-directory: .
+        run: |
+          set -euo pipefail
+          rm -rf -- "${RUNNER_TEMP:?}/kanuvio-private-ci"
+          # npm writes its own debug log under the home directory whenever a
+          # script fails, and that log can contain the failed command's output.
+          rm -rf -- "${HOME:?}/.npm/_logs"
+          printf 'phase=cleanup status=done\n'
