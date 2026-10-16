@@ -1,0 +1,49 @@
+# Minimal read-only probe that answers one question:
+# are standard GitHub-hosted public runners usable by this account?
+#
+# Deliberately narrow: manual dispatch only, contents: read, no checkout of any
+# repository, no secrets or tokens, no third-party actions, no caches or
+# artifacts, no dependency installs, no application source, and no calls to any
+# external or billable service. Every command is a pure local diagnostic.
+name: Public runner smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Standard runner smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Print diagnostic environment
+        run: |
+          echo "PUBLIC_RUNNER_SMOKE_MARKER=OK"
+          echo "runner_os=${RUNNER_OS:-unknown}"
+          echo "runner_arch=${RUNNER_ARCH:-unknown}"
+          echo "runner_name=${RUNNER_NAME:-unknown}"
+          echo "repository=${GITHUB_REPOSITORY:-unknown}"
+          echo "workflow=${GITHUB_WORKFLOW:-unknown}"
+          echo "run_id=${GITHUB_RUN_ID:-unknown}"
+          echo "run_attempt=${GITHUB_RUN_ATTEMPT:-unknown}"
+          echo "actor=${GITHUB_ACTOR:-unknown}"
+          echo "utc_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          uname -a
+          echo "cpu_count=$(nproc)"
+          echo "disk_free_on_root=$(df -h / | awk 'NR==2 {print $4}')"
+
+      - name: Describe the Ubuntu image
+        run: |
+          echo "image_os=${ImageOS:-unknown}"
+          echo "image_version=${ImageVersion:-unknown}"
+          if [ -f /etc/os-release ]; then
+            # shellcheck disable=SC1091
+            . /etc/os-release
+            echo "os_pretty=${PRETTY_NAME:-unknown}"
+          fi
+
+      - name: Confirm smoke test succeeded
+        run: echo "PUBLIC_RUNNER_SMOKE_RESULT=SUCCESS"
