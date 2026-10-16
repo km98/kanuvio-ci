@@ -1,0 +1,108 @@
+# Public-runner bridge for the private Kanuvio repository.
+#
+# Why this exists: the account's Actions restriction blocks private-repository
+# minutes, but standard public-repository runners work — that is what
+# `public-runner-smoke.yml` established. This workflow reproduces the Linux
+# validation that `km98/embrace-your-books` runs in its own "Web CI" workflow,
+# on a public runner, and it moves no source into this repository.
+#
+# Security boundary — every line below is deliberate:
+#   * `workflow_dispatch` is the only trigger and it accepts no inputs, so no
+#     caller can select a ref, a command, a path or a range.
+#   * The job's `if` re-checks the event, the repository, the branch and both
+#     actor fields. The event check is what keeps a trigger added by mistake
+#     later (a `push` to `main` by the same account, say) from silently running
+#     a job that holds the private token.
+#   * The private source is fetched with a fine-grained token that grants
+#     `Contents: Read-only` on that one repository. The token is passed to the
+#     checkout action's `token` input and nowhere else — it is never declared in
+#     a job- or workflow-level `env`, so `npm ci`, the tests and the build
+#     cannot read it. `persist-credentials: false` also keeps it out of the
+#     checked-out `.git/config`.
+#   * No artifacts, caches, packages, releases or deployments. The production
+#     build writes to the runner's scratch disk and nothing leaves it, which is
+#     why `setup-node` below turns its download cache off explicitly.
+#   * Logs contain only the tools' own diagnostics. Worth stating plainly: this
+#     repository is public, so its logs are public, and a failing typecheck or
+#     test prints the private source lines around the failure.
+#
+# This is Linux validation only. macOS signing and notarization, release
+# publishing, Windows packaging and every production credential stay in the
+# private repository's own workflows.
+name: Private Kanuvio CI (public runner)
+
+on:
+  workflow_dispatch:
+
+# Read-only. Nothing here writes to either repository.
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Private Kanuvio web validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'km98/kanuvio-ci' &&
+      github.ref == 'refs/heads/main' &&
+      github.actor == 'km98' &&
+      github.triggering_actor == 'km98'
+    defaults:
+      run:
+        # Every run step works inside the private checkout, never in this
+        # repository's workspace.
+        working-directory: private-source
+    steps:
+      - name: Check out the private source with the read-only token
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: km98/embrace-your-books
+          ref: main
+          path: private-source
+          # Supplied as an action input only: this is the single place the
+          # token is used, and no step environment ever receives it.
+          token: ${{ secrets.KANUVIO_PRIVATE_READ_TOKEN }}
+          persist-credentials: false
+          # The whitespace check below compares the tip against its parent, and
+          # the private Web CI uses the same full history for the same reason.
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # Node 24 is what the private Web CI uses and what the deployed build
+          # was made with.
+          node-version: 24
+          # setup-node caches npm downloads by default when package.json names
+          # an npm package manager. Caches are out of scope for this bridge.
+          package-manager-cache: false
+
+      # `npm ci` installs exactly what the committed lockfile pins, so a
+      # lockfile that has drifted from package.json fails the job instead of
+      # quietly changing what is validated.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # The whole suite, run through the installed binary rather than `npx`, so
+      # a dependency missing from the lockfile fails the step. The only tests
+      # that touch a database are gated on a loopback Supabase stack and skip
+      # themselves when its keys are absent, which they are here.
+      - name: Test
+        run: ./node_modules/.bin/vitest run
+
+      - name: Build
+        run: npm run build
+
+      # The private Web CI's own whitespace check. A dispatched run has no
+      # `before` sha, so the change it is about is the tip commit on `main`.
+      - name: Whitespace integrity
+        run: |
+          set -euo pipefail
+          range="HEAD~1...HEAD"
+          echo "Checking whitespace in $range"
+          git diff --check "$range"
